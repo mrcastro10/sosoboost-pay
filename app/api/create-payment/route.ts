@@ -1,84 +1,100 @@
 import { NextResponse } from "next/server";
 
+function parseBodySmart(raw: string) {
+  // 1) Try JSON
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // 2) Try form-urlencoded: user_id=1&amount=500
+    const params = new URLSearchParams(raw);
+    const obj: Record<string, any> = {};
+    for (const [k, v] of params.entries()) obj[k] = v;
+    return obj;
+  }
+}
+
+export async function OPTIONS() {
+  // CORS preflight
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
+}
+
 export async function POST(req: Request) {
   try {
-    const contentType = req.headers.get("content-type") || "";
+    const raw = await req.text();
+    const body = raw ? parseBodySmart(raw) : {};
 
-    // 1) Lire le body en JSON si possible, sinon en texte (form-urlencoded)
-    let body: any = {};
-    if (contentType.includes("application/json")) {
-      body = await req.json();
-    } else {
-      const text = await req.text(); // ex: "user_id=7&amount=500"
-      const params = new URLSearchParams(text);
-      body = {
-        user_id: params.get("user_id"),
-        amount: params.get("amount"),
-      };
-    }
-
-    // 2) Nettoyer et valider
-    const user_id = Number(body.user_id);
+    const user_id = Number(body.user_id ?? body.userId);
     const amount = Number(body.amount);
 
-    if (!Number.isFinite(user_id) || user_id <= 0) {
-      return NextResponse.json({ ok: false, error: "user_id invalide" }, { status: 400 });
-    }
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return NextResponse.json({ ok: false, error: "amount invalide" }, { status: 400 });
-    }
-
-    // 3) Appel PayTech (via ton API existant)
-    const apiKey = process.env.PAYTECH_API_KEY!;
-    const apiSecret = process.env.PAYTECH_API_SECRET!;
-    const paytechBaseUrl = process.env.PAYTECH_BASE_URL || "https://paytech.sn/api";
-
-    if (!apiKey || !apiSecret) {
-      return NextResponse.json({ ok: false, error: "PAYTECH keys manquantes" }, { status: 500 });
+    if (!user_id || !amount || amount <= 0) {
+      return NextResponse.json(
+        { ok: false, error: "user_id ou amount invalide" },
+        { status: 400 }
+      );
     }
 
-    const ref = `SB-${user_id}-${Date.now()}`;
+    const PAYTECH_API_KEY = process.env.PAYTECH_API_KEY!;
+    const PAYTECH_API_SECRET = process.env.PAYTECH_API_SECRET!;
+    const PAYTECH_BASE_URL = process.env.PAYTECH_BASE_URL || "https://paytech.sn/api";
+    const APP_BASE_URL = process.env.APP_BASE_URL || "https://sosoboost-pay.vercel.app";
 
-    // IMPORTANT: PayTech demande souvent form-urlencoded
-    const payload = new URLSearchParams();
-    payload.append("item_name", "Recharge SosoBoost");
-    payload.append("item_price", String(amount));
-    payload.append("command_name", ref);
+    // On met les infos dans ref_command pour que le webhook retrouve user_id + amount
+    const ref_command = `SB_${Date.now()}_${user_id}_${amount}`;
 
-    const paytechRes = await fetch(`${paytechBaseUrl}/payment/request-payment`, {
+    // IMPORTANT: redirections sur Vercel (PAS sur ton ancien hébergeur)
+    const success_url = `${APP_BASE_URL}/success`;
+    const cancel_url = `${APP_BASE_URL}/cancel`;
+
+    // PayTech (exemple standard)
+    const payload = {
+      item_name: "Depot SosoBoost",
+      item_price: amount,
+      currency: "XOF",
+      ref_command,
+      env: "prod",
+      ipn_url: `${APP_BASE_URL}/api/paytech-webhook`,
+      success_url,
+      cancel_url,
+    };
+
+    const r = await fetch(`${PAYTECH_BASE_URL}/payment/request-payment`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "API_KEY": apiKey,
-        "API_SECRET": apiSecret,
+        "Content-Type": "application/json",
+        // Selon PayTech, ça peut être API_KEY / API_SECRET en header
+        "API_KEY": PAYTECH_API_KEY,
+        "API_SECRET": PAYTECH_API_SECRET,
       },
-      body: payload.toString(),
+      body: JSON.stringify(payload),
     });
 
-    const paytechData = await paytechRes.json().catch(() => ({}));
+    const data = await r.json().catch(() => ({}));
 
-    // Selon PayTech, le lien est souvent dans redirect_url / redirectUrl
-    const payUrl = paytechData.redirect_url || paytechData.redirectUrl;
-
-    if (!payUrl) {
+    if (!data || data.success !== 1 || !data.redirect_url) {
       return NextResponse.json(
-        { ok: false, error: "PayTech: lien de paiement introuvable", details: paytechData },
+        { ok: false, error: "PayTech: lien de paiement introuvable", details: data },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({
-      ok: true,
-      pay_url: payUrl,
-      token: paytechData.token,
-      paytech: paytechData,
-      ref,
-      user_id,
-      amount,
-    });
+    return NextResponse.json(
+      { ok: true, pay_url: data.redirect_url, token: data.token, paytech: data },
+      {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+        },
+      }
+    );
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: `Unexpected error: ${e?.message || "unknown"}` },
+      { ok: false, error: e?.message || "Erreur serveur" },
       { status: 500 }
     );
   }
