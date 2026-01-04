@@ -2,66 +2,83 @@ import { NextResponse } from "next/server";
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
+    const contentType = req.headers.get("content-type") || "";
 
-    // 1) Lire le montant
+    // 1) Lire le body en JSON si possible, sinon en texte (form-urlencoded)
+    let body: any = {};
+    if (contentType.includes("application/json")) {
+      body = await req.json();
+    } else {
+      const text = await req.text(); // ex: "user_id=7&amount=500"
+      const params = new URLSearchParams(text);
+      body = {
+        user_id: params.get("user_id"),
+        amount: params.get("amount"),
+      };
+    }
+
+    // 2) Nettoyer et valider
+    const user_id = Number(body.user_id);
     const amount = Number(body.amount);
-    if (!amount || amount < 1) {
-      return NextResponse.json(
-        { ok: false, error: "Montant invalide" },
-        { status: 400 }
-      );
+
+    if (!Number.isFinite(user_id) || user_id <= 0) {
+      return NextResponse.json({ ok: false, error: "user_id invalide" }, { status: 400 });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return NextResponse.json({ ok: false, error: "amount invalide" }, { status: 400 });
     }
 
-    // 2) Vérifier que les clés PayTech existent dans Vercel
-    const API_KEY = process.env.PAYTECH_API_KEY || "";
-    const API_SECRET = process.env.PAYTECH_API_SECRET || "";
-    if (!API_KEY || !API_SECRET) {
-      return NextResponse.json(
-        { ok: false, error: "Clés PayTech manquantes dans Vercel (PAYTECH_API_KEY / PAYTECH_API_SECRET)" },
-        { status: 500 }
-      );
+    // 3) Appel PayTech (via ton API existant)
+    const apiKey = process.env.PAYTECH_API_KEY!;
+    const apiSecret = process.env.PAYTECH_API_SECRET!;
+    const paytechBaseUrl = process.env.PAYTECH_BASE_URL || "https://paytech.sn/api";
+
+    if (!apiKey || !apiSecret) {
+      return NextResponse.json({ ok: false, error: "PAYTECH keys manquantes" }, { status: 500 });
     }
 
-    // 3) Appel PayTech (demande de paiement)
-    // NOTE: si ton endpoint PayTech est différent dans ton compte, dis-moi,
-    // mais d’après ta capture, PayTech renvoie bien token + redirect_url.
-    const paytechRes = await fetch("https://paytech.sn/api/payment/request-payment", {
+    const ref = `SB-${user_id}-${Date.now()}`;
+
+    // IMPORTANT: PayTech demande souvent form-urlencoded
+    const payload = new URLSearchParams();
+    payload.append("item_name", "Recharge SosoBoost");
+    payload.append("item_price", String(amount));
+    payload.append("command_name", ref);
+
+    const paytechRes = await fetch(`${paytechBaseUrl}/payment/request-payment`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "API_KEY": API_KEY,
-        "API_SECRET": API_SECRET,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "API_KEY": apiKey,
+        "API_SECRET": apiSecret,
       },
-      body: JSON.stringify({
-        item_name: "Depot SosoBoost",
-        item_price: amount,
-        currency: "XOF",
-        ref_command: `DEPOT_${Date.now()}`,
-      }),
+      body: payload.toString(),
     });
 
-    const data = await paytechRes.json();
+    const paytechData = await paytechRes.json().catch(() => ({}));
 
-    // 4) IMPORTANT: PayTech renvoie redirect_url / redirectUrl (pas payment_url)
-    const payUrl = data.redirect_url || data.redirectUrl;
+    // Selon PayTech, le lien est souvent dans redirect_url / redirectUrl
+    const payUrl = paytechData.redirect_url || paytechData.redirectUrl;
+
     if (!payUrl) {
       return NextResponse.json(
-        { ok: false, error: "PayTech: lien de paiement introuvable", details: data },
+        { ok: false, error: "PayTech: lien de paiement introuvable", details: paytechData },
         { status: 500 }
       );
     }
 
-    // 5) Réponse OK
     return NextResponse.json({
       ok: true,
       pay_url: payUrl,
-      token: data.token || null,
-      paytech: data,
+      token: paytechData.token,
+      paytech: paytechData,
+      ref,
+      user_id,
+      amount,
     });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: e?.message || "Erreur serveur" },
+      { ok: false, error: `Unexpected error: ${e?.message || "unknown"}` },
       { status: 500 }
     );
   }
